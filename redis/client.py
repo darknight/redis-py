@@ -24,6 +24,9 @@ from redis.exceptions import (
     WatchError,
 )
 
+from tornado import gen
+from tornado.concurrent import Future, is_future
+
 SYM_EMPTY = b('')
 
 
@@ -563,26 +566,27 @@ class StrictRedis(object):
         return PubSub(self.connection_pool, **kwargs)
 
     # COMMAND EXECUTION AND PROTOCOL PARSING
+    @gen.coroutine
     def execute_command(self, *args, **options):
         "Execute a command and return a parsed response"
         pool = self.connection_pool
         command_name = args[0]
         connection = pool.get_connection(command_name, **options)
         try:
-            connection.send_command(*args)
-            return self.parse_response(connection, command_name, **options)
+            response = yield connection.send_command(*args)
+            result = self.parse_response(response, command_name, **options)
         except (ConnectionError, TimeoutError) as e:
             connection.disconnect()
             if not connection.retry_on_timeout and isinstance(e, TimeoutError):
                 raise
-            connection.send_command(*args)
-            return self.parse_response(connection, command_name, **options)
+            response = yield connection.send_command(*args)
+            result = self.parse_response(response, command_name, **options)
         finally:
             pool.release(connection)
+            raise gen.Return(result)
 
-    def parse_response(self, connection, command_name, **options):
+    def parse_response(self, response, command_name, **options):
         "Parses a response from the Redis server"
-        response = connection.read_response()
         if command_name in self.response_callbacks:
             return self.response_callbacks[command_name](response, **options)
         return response

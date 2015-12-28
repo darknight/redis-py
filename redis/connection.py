@@ -8,6 +8,13 @@ import sys
 import threading
 import warnings
 
+import functools
+from tornado import gen
+from tornado.iostream import IOStream
+from tornado.ioloop import IOLoop
+from tornado.concurrent import Future
+from tornado.tcpclient import TCPClient
+
 try:
     import ssl
     ssl_available = True
@@ -415,6 +422,9 @@ class Connection(object):
             'db': self.db,
         }
         self._connect_callbacks = []
+        # add extra parameters
+        self.stream = None
+        self.tcp_client = TCPClient()
 
     def __repr__(self):
         return self.description_format % self._description_args
@@ -524,45 +534,37 @@ class Connection(object):
 
     def disconnect(self):
         "Disconnects from the Redis server"
-        self._parser.on_disconnect()
-        if self._sock is None:
+        if self.stream is None:
             return
-        try:
-            self._sock.shutdown(socket.SHUT_RDWR)
-            self._sock.close()
-        except socket.error:
-            pass
-        self._sock = None
+        self.stream.close()
+        self.stream = None
 
+    @gen.coroutine
     def send_packed_command(self, command):
         "Send an already packed command to the Redis server"
-        if not self._sock:
-            self.connect()
-        try:
-            if isinstance(command, str):
-                command = [command]
-            for item in command:
-                self._sock.sendall(item)
-        except socket.timeout:
-            self.disconnect()
-            raise TimeoutError("Timeout writing to socket")
-        except socket.error:
-            e = sys.exc_info()[1]
-            self.disconnect()
-            if len(e.args) == 1:
-                errno, errmsg = 'UNKNOWN', e.args[0]
-            else:
-                errno = e.args[0]
-                errmsg = e.args[1]
-            raise ConnectionError("Error %s while writing to socket. %s." %
-                                  (errno, errmsg))
-        except:
-            self.disconnect()
-            raise
+        if not self.stream:
+            self.stream = yield self.tcp_client.connect(self.host, self.port)
+
+            if self.password:
+                response = yield self.send_command('AUTH', self.password)
+                if nativestr(response) != 'OK':
+                    raise AuthenticationError('Invalid Password')
+
+            if self.db:
+                response = yield self.send_command('SELECT', self.db)
+                if nativestr(response) != 'OK':
+                    raise ConnectionError('Invalid Database')
+
+        if isinstance(command, str):
+            command = [command]
+        command = ''.join(command)
+        yield self.stream.write(command)
+        response = yield self.read_response()
+        raise gen.Return(response)
 
     def send_command(self, *args):
         "Pack and send a command to the Redis server"
-        self.send_packed_command(self.pack_command(*args))
+        return self.send_packed_command(self.pack_command(*args))
 
     def can_read(self, timeout=0):
         "Poll the socket to see if there's data that can be read."
@@ -573,16 +575,54 @@ class Connection(object):
         return self._parser.can_read() or \
             bool(select([sock], [], [], timeout)[0])
 
+    @gen.coroutine
     def read_response(self):
         "Read the response from a previously sent command"
-        try:
-            response = self._parser.read_response()
-        except:
-            self.disconnect()
-            raise
-        if isinstance(response, ResponseError):
-            raise response
-        return response
+        header_data = yield self.stream.read_until(SYM_CRLF)
+        # copy from PythonParser.read_response
+        if not header_data:
+            raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
+
+        byte, response = byte_to_chr(header_data[0]), header_data[1:-2]
+
+        if byte not in ('-', '+', ':', '$', '*'):
+            raise InvalidResponse("Protocol Error: %s, %s" %
+                                  (str(byte), str(response)))
+
+        # server returned an error
+        if byte == '-':
+            response = nativestr(response)
+            error = self.parse_error(response)
+            # if the error is a ConnectionError, raise immediately so the user
+            # is notified
+            if isinstance(error, ConnectionError):
+                raise error
+            # otherwise, we're dealing with a ResponseError that might belong
+            # inside a pipeline response. the connection's read_response()
+            # and/or the pipeline's execute() will raise this error if
+            # necessary, so just return the exception instance here.
+            raise gen.Reture(error)
+        # single value
+        elif byte == '+':
+            pass
+        # int value
+        elif byte == ':':
+            response = long(response)
+        # bulk response
+        elif byte == '$':
+            length = int(response)
+            if length == -1:
+                raise gen.Return(None)
+            response = yield self.stream.read_bytes(length)
+        # multi-bulk response
+        elif byte == '*':
+            length = int(response)
+            if length == -1:
+                raise gen.Return(None)
+            response = yield [self.read_response() for i in xrange(length)]
+        if isinstance(response, bytes) and self.encoding:
+            response = response.decode(self.encoding)
+        raise gen.Return(response)
 
     def encode(self, value):
         "Return a bytestring representation of the value"
